@@ -6,13 +6,21 @@
 
 package runtime
 
+import (
+	_ "unsafe"
+)
+
 // js/wasm has no support for threads yet. There is no preemption.
-// Waiting for a mutex or timeout is implemented as a busy loop
-// while allowing other goroutines to run.
+// Waiting for a mutex is implemented by allowing other goroutines
+// to run until the mutex gets unlocked.
 
 const (
 	mutex_unlocked = 0
 	mutex_locked   = 1
+
+	note_cleared = 0
+	note_woken   = 1
+	note_timeout = 2
 
 	active_spin     = 4
 	active_spin_cnt = 30
@@ -34,16 +42,30 @@ func unlock(l *mutex) {
 }
 
 // One-time notifications.
+
+type noteWithTimeout struct {
+	gp       *g
+	deadline int64
+}
+
+var (
+	notes            = make(map[*note]*g)
+	notesWithTimeout = make(map[*note]noteWithTimeout)
+)
+
 func noteclear(n *note) {
-	n.key = 0
+	n.key = note_cleared
 }
 
 func notewakeup(n *note) {
-	if n.key != 0 {
-		print("notewakeup - double wakeup (", n.key, ")\n")
+	if n.key == note_woken {
 		throw("notewakeup - double wakeup")
 	}
-	n.key = 1
+	cleared := n.key == note_cleared
+	n.key = note_woken
+	if cleared {
+		goready(notes[n], 1)
+	}
 }
 
 func notesleep(n *note) {
@@ -62,14 +84,69 @@ func notetsleepg(n *note, ns int64) bool {
 		throw("notetsleepg on g0")
 	}
 
-	deadline := nanotime() + ns
-	for {
-		if n.key != 0 {
-			return true
+	if ns >= 0 {
+		deadline := nanotime() + ns
+		delay := ns/1000000 + 1 // round up
+		if delay > 1<<31-1 {
+			delay = 1<<31 - 1 // cap to max int32
 		}
-		Gosched()
-		if ns >= 0 && nanotime() >= deadline {
-			return false
+
+		id := scheduleCallback(delay)
+		notes[n] = gp
+		notesWithTimeout[n] = noteWithTimeout{gp: gp, deadline: deadline}
+		gopark(nil, nil, waitReasonSleep, traceEvNone, 1)
+		clearScheduledCallback(id) // note might have woken early, clear timeout
+		delete(notes, n)
+		delete(notesWithTimeout, n)
+
+		return n.key == note_woken
+	}
+
+	for n.key != note_woken {
+		notes[n] = gp
+		gopark(nil, nil, waitReasonZero, traceEvNone, 1)
+		delete(notes, n)
+	}
+	return true
+}
+
+func checkTimeouts() {
+	now := nanotime()
+	for n, nt := range notesWithTimeout {
+		if n.key == note_cleared && now > nt.deadline {
+			n.key = note_timeout
+			goready(nt.gp, 1)
 		}
 	}
 }
+
+var waitingForCallback *g
+
+//go:linkname sleepUntilCallback syscall/js.sleepUntilCallback
+func sleepUntilCallback() {
+	waitingForCallback = getg()
+	gopark(nil, nil, waitReasonZero, traceEvNone, 1)
+	waitingForCallback = nil
+}
+
+func pauseSchedulerUntilCallback() bool {
+	if waitingForCallback == nil && len(notesWithTimeout) == 0 {
+		return false
+	}
+
+	pause()
+	checkTimeouts()
+	if waitingForCallback != nil {
+		goready(waitingForCallback, 1)
+	}
+	return true
+}
+
+// pause pauses the execution of Go's WebAssembly code until a callback is triggered.
+func pause()
+
+// scheduleCallback tells the WebAssembly environment to trigger a callback after ms milliseconds.
+func scheduleCallback(ms int64) int32
+
+// clearScheduledCallback clears a callback scheduled by scheduleCallback.
+func clearScheduledCallback(id int32)

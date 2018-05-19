@@ -263,6 +263,7 @@ func forcegchelper() {
 // Gosched yields the processor, allowing other goroutines to run. It does not
 // suspend the current goroutine, so execution resumes automatically.
 func Gosched() {
+	checkTimeouts()
 	mcall(gosched_m)
 }
 
@@ -282,6 +283,9 @@ func goschedguarded() {
 // Reasons should be unique and descriptive.
 // Do not re-use reasons, add new ones.
 func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason waitReason, traceEv byte, traceskip int) {
+	if reason != waitReasonSleep {
+		checkTimeouts() // timeouts may expire while two goroutines keep the scheduler busy
+	}
 	mp := acquirem()
 	gp := mp.curg
 	status := readgstatus(gp)
@@ -2353,6 +2357,10 @@ stop:
 			traceGoUnpark(gp, 0)
 		}
 		return gp, false
+	}
+
+	if pauseSchedulerUntilCallback() {
+		goto top
 	}
 
 	// Before we drop our P, make a snapshot of the allp slice,

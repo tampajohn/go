@@ -40,6 +40,8 @@ var (
 	Global = Value{2}
 
 	memory = Value{3}
+
+	resolveCallbackPromise = Value{4}
 )
 
 var uint8Array = Global.Get("Uint8Array")
@@ -49,6 +51,8 @@ func ValueOf(x interface{}) Value {
 	switch x := x.(type) {
 	case Value:
 		return x
+	case Callback:
+		return x.value
 	case nil:
 		return Null
 	case bool:
